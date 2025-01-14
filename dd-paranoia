@@ -11,6 +11,14 @@
 # - Invoke sudo automatically when needed to write to output
 # - Auto-unmount mounts on output device using umount or devmon
 #
+# Anti-features / Caveats:
+# - Unlike dd, it'll only allow you to write to block devices
+# - The way in which "newest" is determined when using the MinIO CLI is not
+#   guaranteed to be accurate: minio yields timestamps in the server's locale
+#   and timezone, which is difficult to account for.
+# - It's a shellscript, so it's not *that* paranoid
+# - Use of ANSI codes is hardcoded
+#
 # Copyright (C) 2024 Kristian Gunstone
 # Use of this source code is governed by the Simplified BSD License:
 # https://opensource.org/license/bsd-2-clause
@@ -71,7 +79,7 @@ Examples:
    \$ $me -i foo -o /dev/mmc0
   Use 'foo' from minio alias store as input, '/dev/mmc0' as output:
    \$ $me -i "minio://store/foo" -o /dev/mmc0
-  Use 'foo' as input, select output interactively
+  Use 'foo' as input, select output interactively:
    \$ $me -i foo
   Assert that the output device model begins with "Samsung" followed by "SSD":
    \$ $me -m "^Samsung.*SSD" -i foo -o /dev/mmc0
@@ -466,9 +474,8 @@ choose_device()
     if [ "$dev_count" = "1" ]
     then
         # What's the point? If there's only one, surely it's the *wrong* one
-        echo "Only one device available: selecting ${devlist_name[0]} automatically"
-        opt_dst="${devlist_name[0]}"
-        return
+        echo "Only one device available: surely you're not writing to it" >&2
+        exit 1
     fi
 
     local msg="Select an output device [1-$dev_count] "
