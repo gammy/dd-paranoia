@@ -82,9 +82,9 @@ Examples:
 If no output device is specified, you will be asked interactively.
 
 Options:
-  -i <s>, --input=<file>         Use <file> as the source to write. Files with a '.gz' suffix get decompressed. To access a Minio service, prefix <file> "minio://". Default: $default_src
+  -i <s>, --input <file>         Use <file> as the source to write. Files with a '.gz' suffix get decompressed. To access a Minio service, prefix <file> "minio://". Default: $default_src
   -n <p>, --newest <pattern>     Treat -i as an input directory and pick the newest file matching <pattern>, as expressed in a glob. Default: $default_use_newest
-  -o <d>, --output=<device>      Write the source to <device>. Default: $default_dst
+  -o <d>, --output <device>      Write the source to <device>. Default: $default_dst
   -B <p>, --mc-bin <path>        Override MinIO CLI binary with <path>. Can also be set by MINIO_CLI_BIN. Default: $default_mc_bin
   -s <s>, --device-size <size>   Verify that <device> size is <size>. The format of <size> is the same as 'lsblk' or $me's output. Default: $default_dst_match_size
   -m <m>, --device-model <model> Verify that the model name of <device> matches regular expression <model>, as expresssed with 'grep -P', i.e Perl expressions. Default: $default_dst_match_model
