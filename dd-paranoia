@@ -15,6 +15,8 @@
 # Use of this source code is governed by the Simplified BSD License:
 # https://opensource.org/license/bsd-2-clause
 
+DDP_VERSION=0.8
+
 default_src="(none)"
 default_dst=ask # Only used in `show_help`
 
@@ -59,7 +61,8 @@ usage()
 {
     me=$(basename $0)
     cat << EOF
-$me: A paranoid wrapper for 'dd'
+$me v$DDP_VERSION
+A paranoid wrapper for 'dd'.
 
 Usage: $me -i <input file> [-o <output device>] [...]
 
