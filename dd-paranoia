@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+# dd-paranoia: A paranoid wrapper for 'dd'.
+# By gammy, anno 2024. To reach me, try https://github.com/gammy
+#
+# Key features:
+# - Assert model and/or size of the output device matches a pattern
+# - Minio source support (by prefixing 'minio://' to source path)
+# - Decompress gzip (.gz) source on the fly whilst writing
+# - Use the newest file in a directory (-n / --newest)
+# - List available output devices (-l / --ls)
+# - Invoke sudo automatically when needed to write to output
+# - Auto-unmount mounts on output device using umount or devmon
+#
+# Copyright (C) 2024 Kristian Gunstone
+# Use of this source code is governed by the Simplified BSD License:
+# https://opensource.org/license/bsd-2-clause
+
+default_src="(none)"
+default_dst=ask # Only used in `show_help`
+
+default_dst_match_model="(any)"
+opt_dst_match_model=$default_dst_match_model
+use_dst_match_model=no
+
+default_dst_match_size='(any)'
+opt_dst_match_size=$default_dst_match_size
+use_dst_match_size=no
+
+default_use_sudo=yes
+opt_use_sudo=$default_use_sudo
+
+default_use_newest=no
+use_newest_pattern=$default_use_newest
+opt_newest_pattern=
+
+default_force=no
+
+default_mc_bin=mccli
+[ -n "$MINIO_CLI_BIN"] && default_mc_bin="$MINIO_CLI_BIN"
+opt_mc_bin=$default_mc_bin
+mc_args=(--no-color --disable-pager)
+export MC_NO_COLOR=1 # Some versions seem to ignore --no-color?
+
+default_dd_blocksize=8M
+opt_dd_blocksize=$default_dd_blocksize
+
+ANSI_RED="\e[31;1m"
+ANSI_GREEN="\e[32;1m"
+ANSI_YELLER="\e[33;1m"
+ANSI_MATCH_NAME=$ANSI_GREEN
+ANSI_MATCH_SIZE=$ANSI_GREEN
+ANSI_MATCH_MODEL=$ANSI_GREEN
+ANSI_MATCH_ALL="\e[4m"
+ANSI_RESET="\e[0m"
+
+#############################################################################
+
+usage()
+{
+    me=$(basename $0)
+    cat << EOF
+$me: A paranoid wrapper for 'dd'
+
+Usage: $me -i <input file> [-o <output device>] [...]
+
+Examples:
+  Use 'foo' as input, '/dev/mmc0' as output:
+   \$ $me -i foo -o /dev/mmc0
+  Use 'foo' from minio alias store as input, '/dev/mmc0' as output:
+   \$ $me -i "minio://store/foo" -o /dev/mmc0
+  Use 'foo' as input, select output interactively
+   \$ $me -i foo
+  Assert that the output device model begins with "Samsung" followed by "SSD":
+   \$ $me -m "^Samsung.*SSD" -i foo -o /dev/mmc0
+  Assert output device size:
+   \$ $me -s "250G" -i foo -o /dev/mmc0
+  Use the latest file matching a pattern in a directory (which is scanned recursively) on MinIO and prompt for output selection:
+   \$ $me -i "minio://store/foo/" -n "*daily*.raw.gz"
+  List available output devices and highlight Samsung models:
+   \$ $me --ls -m Samsung
+
+If no output device is specified, you will be asked interactively.
+
+Options:
+  -i <s>, --input=<file>         Use <file> as the source to write. Files with a '.gz' suffix get decompressed. To access a Minio service, prefix <file> "minio://". Default: $default_src
+  -n <p>, --newest <pattern>     Treat -i as an input directory and pick the newest file matching <pattern>, as expressed in a glob. Default: $default_use_newest
+  -o <d>, --output=<device>      Write the source to <device>. Default: $default_dst
+  -B <p>, --mc-bin <path>        Override MinIO CLI binary with <path>. Can also be set by MINIO_CLI_BIN. Default: $default_mc_bin
+  -s <s>, --device-size <size>   Verify that <device> size is <size>. The format of <size> is the same as 'lsblk' or $me's output. Default: $default_dst_match_size
+  -m <m>, --device-model <model> Verify that the model name of <device> matches regular expression <model>, as expresssed with 'grep -P', i.e Perl expressions. Default: $default_dst_match_model
+  -r <a>, --sudo <yes|no>        Toggle the use of 'sudo' when invoking 'dd'. This option has no effect if $me is being run as root. Default: yes
+  -t <s>, --block-size <size     Set the blocksize used by 'dd' to <size>. Defualt: $default_dd_blocksize
+  -l,     --ls                   List devices and exit (akin to lsblk).
+  -D,     --dry-run              Take no action (disable gunzip, dd and umount). Default: no
+  -f,     --force                Ignore safety checks (but not warning prompts). Default: $default_force
+  -h,     --help                 Show this info
+EOF
+}
+
+assert_deps()
+{
+    deps=(bash awk sed grep xargs cut stat sort tail head mktemp lsblk dd)
+    deps_missing=
+
+    for dep in ${deps[@]}
+    do
+        # While GNU Which prints its own nice message to stderr if the program is
+        # missing, other implementations do not.
+        if ! which $dep > /dev/null 2>&1
+        then
+            echo "Missing dependency: $dep" >&2
+            deps_missing=yes
+        fi
+    done
+
+    if [ -n "$deps_missing" ]
+    then
+        echo "Unable to continue" >&2
+        exit 1
+    fi
+}
+
+notices()
+{
+    if [ "$use_dst_match_size" = "yes" ]
+    then
+        echo -e "${ANSI_GREEN}Output size check enabled${ANSI_RESET}"
+    else
+        echo -e "${ANSI_YELLER}Output size check disabled${ANSI_RESET}, enable with -s / --device-size"
+    fi
+
+    if [ "$use_dst_match_model" = "yes" ]
+    then
+        echo -e "${ANSI_GREEN}Output model check enabled${ANSI_RESET}"
+    else
+        echo -e "${ANSI_YELLER}Output device model check disabled${ANSI_RESET}, enable with -m / --device-model"
+    fi
+}
+
+list_devices()
+{
+    echo "$dev_count devices:"
+
+    have_match=no
+    dst_index=
+    dst_matches_size=no
+    dst_matches_model=no
+
+    size_indexes=()
+    model_indexes=()
+
+    for((i=0;i<$dev_count;i++))
+    do
+        # Sad, isn't it.
+
+        # Clear the board
+        local size_pass=yes
+        local model_pass=yes
+        local size_match=
+        local size_ansi_beg=
+        local size_ansi_end=
+
+
+        dst_match= dst_ansi_beg= dst_ansi_end=
+        model_match= model_ansi_beg= model_ansi_end=
+        matched_ansi=
+
+        # "is /dev/foo in our list?"
+        if [ "${devlist_name[$i]}" = "$opt_dst" ]
+        then
+            dst_match=yes
+            dst_ansi_beg=$ANSI_MATCH_NAME
+            dst_ansi_end=$ANSI_RESET
+			dst_index=$i
+        fi
+
+        # Does the size of /dev/foo match the required size ?
+        if [ "$use_dst_match_size" = "yes" ]
+        then
+            if [ "${devlist_size[$i]}" = "$opt_dst_match_size" ]
+            then
+                size_match=yes
+                size_ansi_beg=$ANSI_MATCH_SIZE
+                size_ansi_end=$ANSI_RESET
+                size_indexes+=($i)
+            else
+                size_pass=no
+                size_ansi_beg=$ANSI_RED
+                size_ansi_end=$ANSI_RESET
+            fi
+        fi
+
+        # Does the model name of the /dev/foo device match the required model pattern ?
+        if [ "$use_dst_match_model" = "yes" ]
+        then
+            if echo "${devlist_model[$i]}" | grep -qP "$opt_dst_match_model"
+            then
+                model_match=yes
+                model_pass=yes
+                model_ansi_beg=$ANSI_MATCH_MODEL
+                model_ansi_end=$ANSI_RESET
+                model_indexes+=($i)
+            else
+                model_pass=no
+                model_ansi_beg=$ANSI_RED
+                model_ansi_end=$ANSI_RESET
+            fi
+        fi
+
+        # echo "matched_index = '$matched_index', dst_match='$dst_match', size_pass='$size_pass', model_pass='$model_pass', model_match='$model_match', size_match='$size_match'"
+
+		if [ -z "$matched_index" -a "$dst_match" = "yes" ]
+        then
+            dst_matches_size=$size_match
+            dst_matches_model=$model_match
+
+            [ "$use_dst_match_model" = "yes" ] \
+                && model_result=$model_match \
+                || model_result=$model_pass
+
+            [ "$use_dst_match_size" = "yes" ] \
+                && size_result=$size_match \
+                || size_result=$size_pass
+
+            if [ "$size_result" = "yes" -a "$model_result" = "yes" ]
+            then
+                have_match=yes
+                matched_index=$i
+                matched_ansi=$ANSI_MATCH_ALL
+            fi
+
+            if [ "$model_match" = "yes" -a "$size_match" = "yes" ]
+            then
+                matched_ansi=$ANSI_MATCH_ALL
+                # dst_ansi_beg= size_ansi_beg= model_ansi_beg=
+                # dst_ansi_end= size_ansi_end= model_ansi_end=
+                dst_ansi_end=$matched_ansi
+                size_ansi_end=$matched_ansi
+                model_ansi_end=$matched_ansi
+            fi
+        fi
+
+        let num=$i+1
+
+        printf "%b%2d: %b%15s%b (%2d parts) %b%10s%b     \"%b%s%b\"$ANSI_RESET\n" \
+            "$matched_ansi" \
+            $num \
+            "${dst_ansi_beg}" "${devlist_name[$i]}" "${dst_ansi_end}" \
+            "${devlist_pcount[$i]}" \
+            "${size_ansi_beg}" "${devlist_size[$i]}" "${size_ansi_end}" \
+            "${model_ansi_beg}" "${devlist_model[$i]}" "${model_ansi_end}"
+    done
+
+    echo
+}
+
+enum_devices()
+{
+    # Reset globals
+    devlist_name=() devlist_size=() devlist_model=()
+    devlist_pcount=() devlist_parts=()
+    matched_index=
+
+    local tmpfile=`mktemp`
+    readarray -t entries < <(lsblk --nodeps --pairs -o NAME,SIZE,MODEL)
+
+    dev_count=0
+    for entry in "${entries[@]}"
+    do
+        echo $entry > $tmpfile
+        source $tmpfile
+        [[ "$NAME" =~ ^loop[0-9]* ]] && continue
+        devlist_name+=("/dev/$NAME")
+        devlist_size+=("$SIZE")
+        devlist_model+=("$MODEL")
+        partlist=(`ls /dev/$NAME?* 2>/dev/null`)
+        devlist_pcount+=(${#partlist[@]})
+        devlist_parts+=("`echo ${partlist[@]}`")
+        let dev_count=$dev_count+1
+    done
+
+    rm "$tmpfile"
+}
+
+match_check()
+{
+    # echo "Have match? >$have_match<"
+    if [ "$have_match" != "yes" ]
+    then
+        # echo "Ok not matching: use size? $use_dst_match_size, matched? $dst_matches_size"
+        # echo "Ok not matching: use model? $use_dst_match_model, matched? $dst_matches_model"
+        if [ "$use_dst_match_size" = "yes" -a "$dst_matches_size" != "yes" ]
+        then
+            size_mismatch=yes
+            printf "${ANSI_RED}%s size \"%s\" does not match expected size \"%s\"${ANSI_RESET}\n" \
+                ${devlist_name[$dst_index]} \
+                ${devlist_size[$dst_index]} \
+                $opt_dst_match_size
+            if [ ${#size_indexes[@]} -gt 0 ]
+            then
+                echo
+                echo "Other devices that are $opt_dst_match_size in size:"
+                for i in ${size_indexes[@]}
+                do
+                    printf "%12s (%s)\n" \
+                        "${devlist_name[$i]}" \
+                        "${devlist_model[$i]}"
+                done
+            else
+                echo -e "${ANSI_RED}(No other devices are $opt_dst_match_size in size)${ANSI_RESET}"
+            fi
+            echo
+        fi
+
+        if [ "$use_dst_match_model" = "yes" -a "$dst_matches_model" != "yes" ]
+        then
+            model_mismatch=yes
+            printf "${ANSI_RED}%s model \"%s\" does not match pattern \"%s\"${ANSI_RESET}\n" \
+                "${devlist_name[$dst_index]}" \
+                "${devlist_model[$dst_index]}" \
+                "$opt_dst_match_model"
+            if [ ${#model_indexes[@]} -gt 0 ]
+            then
+                echo
+                echo "Other devices with models that match \"${opt_dst_match_model}\":"
+                for i in ${model_indexes[@]}
+                do
+                    printf "%12s (%s)\n" \
+                        "${devlist_name[$i]}" \
+                        "${devlist_model[$i]}"
+                done
+            else
+                echo -e "${ANSI_RED}(No other devices match model pattern \"${opt_dst_match_model}\")${ANSI_RESET}"
+            fi
+            echo
+        fi
+
+        [ "$opt_force" != "yes" ] && return 1
+    fi
+
+    return 0
+}
+
+ping_minio()
+{
+    if ! which "$opt_mc_bin" >/dev/null
+    then
+        echo -n "$opt_mc_bin: command not found."
+        echo "Use --mc-bin if your MinIO CLI binary has a different name" >&2
+        return 1
+    fi
+
+    if [ -z "$opt_src" ]
+    then
+        echo "No input supplied" >&2
+        return 1
+    fi
+
+    local minio_alias=`echo "$opt_src" | sed -e 's#/.*$##'`
+    if [ -z "$minio_alias" ]
+    then
+        echo "Unable to derive MinIO alias (server) from input '$opt_src'" >&2
+        return 1
+    fi
+
+    # The user may have supplied nothing but the store alias ("foo") as the
+    # input source: turn it into a path so minio is happy
+    [ "$minio_alias" = "$opt_src" ] && opt_src="$opt_src/"
+
+    echo "Checking if $minio_alias is available"
+    $opt_mc_bin ready $minio_alias
+    local ret=$?
+    mc_crap_workaround
+    return $ret
+}
+
+stat_src()
+{
+    src_size=
+    src_date=
+
+    if [ "$opt_use_minio" = "yes" ]
+    then
+        if [ -z "$opt_src" ]
+        then
+            echo "No input supplied" >&2
+            return 1
+        fi
+        local result_tmp=`mktemp`
+        $opt_mc_bin ${mc_args[@]} stat "$opt_src" > "$result_tmp"
+        mc_ret="$?"
+        mc_crap_workaround
+        if [ "$mc_ret" = "0" ]
+        then
+            src_size=`grep -P '^Size\s+:'  "$result_tmp" | cut -d':' -f2- | xargs`
+            src_date=`grep -P '^Date\s+:'  "$result_tmp" | cut -d':' -f2- | xargs`
+        fi
+        rm "$result_tmp"
+        if [ -z "$src_size" -o -z "$src_date" -o "$mc_ret" != "0" ]
+        then
+            return 1
+        fi
+
+    else
+        if [ ! -e "$opt_src" ]
+        then
+            return 1
+        fi
+        src_size=`du -sh "$opt_src" | cut -f1`
+        src_date=`stat --format=%y "$opt_src" | cut -d. -f1`
+    fi
+
+    return 0
+}
+
+find_newest()
+{
+    if [ -z "$opt_newest_pattern" ]
+    then
+        usage
+        echo
+        echo "-n / --newest requires an argument (for example, '*')" >&2
+        exit 1
+    fi
+
+    if [ "$opt_use_minio" = "yes" ]
+    then
+        # This is extra shady stuff
+        if [ "${opt_src: -1}" != '/' ]
+        then
+            echo "-i / --input must be a directory (specifically, end with a '/') \
+when -n / --newest in effect and MinIO is used" >&2
+            exit 1
+        fi
+        newest_file="`$opt_mc_bin find "$opt_src" -name "$opt_newest_pattern" --print "{time},{}" | sort --field-separator=',' --key=1 | tail -n1 | cut -d, -f2`"
+        mc_crap_workaround
+    else
+        if [ ! -d "$opt_src" ]
+        then
+            echo "-i / --input must be a directory when -n / --newest in effect: \
+\"$opt_src\" is not a directory" >&2
+            exit 1
+        fi
+
+        newest_file="`ls -1t -p $opt_src/$opt_newest_pattern | grep -v '/$' | head -n1`"
+    fi
+
+    if [ -z "$newest_file" ]
+    then
+        echo "\"$opt_src\": Failed to find a source: empty, nonexistent, or unreadable" >&2
+        exit 1
+    fi
+
+    opt_src="$newest_file"
+}
+
+choose_device()
+{
+    enum_devices
+    list_devices
+    echo "Output device (-o / --output) not specified."
+    [ "$dev_count" = "0" ] && exit 1
+    if [ "$dev_count" = "1" ]
+    then
+        # What's the point? If there's only one, surely it's the *wrong* one
+        echo "Only one device available: selecting ${devlist_name[0]} automatically"
+        opt_dst="${devlist_name[0]}"
+        return
+    fi
+
+    local msg="Select an output device [1-$dev_count] "
+    while read -p "$msg" input
+    do
+        input=${input//[[:alpha:]]/}
+        if [ -n "$input" ]
+        then
+            if [ $input -ge 1 -a $input -le $dev_count ]
+            then
+                let selected_index="$input-1"
+                break
+            fi
+        fi
+    done
+
+    opt_dst="${devlist_name[$selected_index]}"
+}
+
+unmount_partitions()
+{
+    which devmon > /dev/null 2>&1
+    have_devmon=$?
+    if [ "$have_devmon" = "0" ]
+    then
+        echo "You seem to have 'devmon', so I'll use that unstead of 'umount'."
+    fi
+
+    for mnt in $(mount | grep $opt_dst | awk '{print $3}')
+    do
+        echo "Unmounting $mnt"
+        if [ "$have_devmon" = "0" ]
+        then
+            devmon --unmount $mnt || exit 1
+        else
+            umount $mnt || exit 1
+        fi
+    done
+}
+
+confirm()
+{
+    local msg="$1"
+    local default="${2,,}"
+    local is_default=
+
+    while read -p "$msg" input
+    do
+        input="${input,,}"
+
+        if [ -z "$input" ]
+        then
+            input="$default"
+            break
+        fi
+
+        if [ "$input" = "y" -o "$input" = "n" ]
+        then
+            break
+        fi
+    done
+
+    if [ "$input" = "$default" ]
+    then
+        return 0
+    fi
+
+    return 1
+}
+
+mc_crap_workaround()
+{
+    # On some terminals, mc seems to spew out ANSI codes to stdin.
+    # This happens even when MC_NO_COLOR is set. As a result, our input
+    # prompts may be contaminated before the user types anything in.
+    # To work around it, we flush 100 chars for 0.1s without prompting.
+    read -t 0.1 -n 100 # Work around mc being shit
+}
+
+transfer()
+{
+    echo "Starting transfer"
+    if [ "$opt_use_sudo" = "yes" ]
+    then
+        local sudo_cmd=sudo
+    fi
+
+    local suffix=${opt_src/*.}
+
+    if [ "$suffix" = "gz" ]
+    then
+        if [ "$opt_use_minio" = "yes" ]
+        then
+            echo $opt_mc_bin ${mc_args[@]} cat \"$opt_src\" \| gunzip --stdout \| $sudo_cmd dd of=\"$opt_dst\" bs=8M conv=fdatasync status=progress
+            if [ "$dry_run" != "yes" ]
+            then
+                $opt_mc_bin ${mc_args[@]} cat "$opt_src" | gunzip --stdout | $sudo_cmd dd of="$opt_dst" bs=8M conv=fdatasync status=progress
+                mc_crap_workaround
+            fi
+        else
+            echo gunzip --stdout \"$opt_src\" \| $sudo_cmd dd of=\"$opt_dst\" bs=8M conv=fdatasync status=progress
+            if [ "$dry_run" != "yes" ]
+            then
+                gunzip --stdout "$opt_src" | $sudo_cmd dd of="$opt_dst" bs=8M conv=fdatasync status=progress
+            fi
+        fi
+    else
+        if [ "$opt_use_minio" = "yes" ]
+        then
+            echo $opt_mc_bin ${mc_args[@]} cat "$opt_src" \| $sudo_cmd dd of=$opt_dst bs=8M conv=fdatasync status=progress
+            if [ "$dry_run" != "yes" ]
+            then
+                $opt_mc_bin ${mc_args[@]} cat "$opt_src" | $sudo_cmd dd of=$opt_dst bs=8M conv=fdatasync status=progress
+            fi
+        else
+            echo $sudo_cmd dd if=\"$opt_src\" of=\"$opt_dst\" bs=8M conv=fdatasync status=progress
+            if [ "$dry_run" != "yes" ]
+            then
+                $sudo_cmd dd if="$opt_src" of="$opt_dst" bs=8M conv=fdatasync status=progress
+            fi
+        fi
+    fi
+}
+
+#############################################################################
+
+if [ $# -eq 0 ]
+then
+    usage
+    exit 0
+fi
+
+assert_deps
+
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -i | --input)
+            opt_src=$2
+            shift
+            ;;
+        -B | --mc-bin)
+            opt_mc_bin=$default_mc_bin
+            shift
+            ;;
+        -o | --output)
+            opt_dst=$2
+            shift
+            ;;
+        -s | --device-size)
+            use_dst_match_size=yes
+            opt_dst_match_size=$2
+            opt_user_set_size=yes # Only used for --ls
+            shift
+            ;;
+        -m | --device-model)
+            use_dst_match_model=yes
+            opt_dst_match_model=$2
+            opt_user_set_model=yes # Only used for --ls
+            shift
+            ;;
+        -t | --block-size)
+            opt_dd_blocksize=$2
+            shift;
+            ;;
+        -r | --sudo)
+            opt_use_sudo=$2
+            shift
+            ;;
+        -n | --newest)
+            use_newest_pattern=yes
+            opt_newest_pattern=$2
+            shift
+            ;;
+        -l | --ls)
+            opt_list_only=yes
+            ;;
+        -f | --force)
+            opt_force=yes
+            ;;
+        -D | --dry-run)
+            dry_run=yes
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            echo
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+
+    shift
+done
+
+[ -z "$opt_force" ] \
+    && opt_force=$default_force
+
+if [[ "$opt_src" =~ ^minio:// ]]
+then
+    opt_src="${opt_src:8}" # Strip off 'minio://'
+    opt_use_minio=yes
+fi
+
+if [ "$opt_use_sudo" != "yes" -a "$opt_use_sudo" != "no" ]
+then
+    usage
+    exit 1
+fi
+
+# The 'ignore' option covers the defaults being set to 'yes' for these.
+[ "$opt_dst_match_size" = "ignore" ] \
+    && use_dst_match_size=no
+
+[ "$opt_dst_match_model" = "ignore" ] \
+    && use_dst_match_model=no
+
+if [ "$opt_list_only" = "yes" ]
+then
+    [ -z "$opt_user_set_size" ] && use_dst_match_size=no
+    [ -z "$opt_user_set_model" ] && use_dst_match_model=no
+    enum_devices
+    list_devices
+    exit 0
+fi
+
+if [ -z "$opt_src" ]
+then
+    usage
+    echo
+    echo "No input device or pattern set: use -i / --input to set one." >&2
+    exit 1
+fi
+
+if [ "$use_dst_match_model" = "yes" ]
+then
+    # Test the sanity of the regex the user supplied
+    res=`echo test | grep -qP "$opt_dst_match_model" 2>&1`
+    if [ $? = 2 ]
+    then
+        echo "Error: model match expression appears invalid:" >&2
+        echo "echo test | grep -P \"$opt_dst_match_model\": $res" >&2
+        exit 1
+    fi
+fi
+
+if [ "$opt_use_minio" = "yes" ]
+then
+    ping_minio || exit 1
+fi
+
+if [ "$use_newest_pattern" = "yes" ]
+then
+    find_newest
+fi
+
+if [ "$opt_use_minio" = "no" ]
+then
+    # (We can't check if src is readable over minio;
+    #  presumably it's readbale if it was listed)
+    if [ ! -r "$opt_src" ]
+    then
+        echo -e "${ANSI_RED}\"$opt_src\": unable to read file!${ANSI_RESET}" >&2
+        echo "TODO: invoke sudo to read it?"
+        exit 1
+    fi
+fi
+
+notices
+
+if [ "$use_dst_match_size" = "no" -a "$use_dst_match_model" = "no" ]
+then
+    no_checks_set=yes
+fi
+
+if ! stat_src
+then
+    if [ "$opt_src" = "$default_src" ]
+    then
+        usage
+        echo
+        echo "Unable to find default input file '$opt_src'" >&2
+    else
+        echo "Unable to find input file '$opt_src'" >&2
+    fi
+    exit 1
+fi
+
+if [ "$dry_run" = "yes" ]
+then
+    echo -e "${ANSI_GREEN}This is a dry run, nothing will be modified${ANSI_RESET}" >&2
+fi
+
+if [ "$opt_force" = "yes" ]
+then
+    echo
+    echo -e "${ANSI_RED}WARNING${ANSI_RESET}: Check failures will be ignored"! >&2
+    echo "Consider using -s / --device-size instead of -f / --force." >&2
+    echo
+fi
+
+if [ -z "$opt_dst" ]
+then
+    choose_device
+fi
+
+if [ "$opt_use_sudo" = "yes" -a "$EUID" != "0" ]
+then
+    if [ -w "$opt_dst" ]
+    then
+        echo "Disabling sudo: current user (`whoami` with EUID $EUID) has write access to \"$opt_dst\""
+        opt_use_sudo=no
+    else
+        # Just run sudo without doing anything to hopefully reset the password
+        # entry timeout so that subsequent calls don't suddenly prompt again.
+        echo "Invoking sudo to cache its authentication for subsequent calls"
+        sudo echo -n || exit 1
+    fi
+fi
+
+enum_devices
+list_devices
+
+if [ ! -e "$opt_dst" ]
+then
+    ls $opt_dst
+    exit 1
+fi
+
+match_check || exit 1
+
+echo "Input : $opt_src ($src_size, $src_date)"
+echo "Output: $opt_dst (${devlist_size[$dst_index]}), ${devlist_model[$dst_index]}"
+echo
+
+confirm "Continue? [y/N] " N && exit 0
+
+if [ "$no_checks_set" = "yes" ]
+then
+    # We don't care whether or not --force is set here;
+    # having no checks always shows a warning.
+    confirm "You know that no safety checks have been set, right? [y/N] " N && exit 0
+    echo "Well okay then."
+else
+    # We won't reach this point or condition unless --force is in effect
+    if [ -n "$model_mismatch" -o -n "$size_mismatch" ]
+    then
+        echo -e "${ANSI_RED}One or more checks failed but you're using --force${ANSI_RESET}"
+        confirm "Are you really sure you want to do this? [y/N] " N && exit 0
+        echo "Let's DO this! ^___^"
+    fi
+fi
+
+if [ "$dry_run" != "yes" ]
+then
+    unmount_partitions
+fi
+
+transfer
