@@ -46,7 +46,7 @@ opt_newest_pattern=
 default_force=no
 
 default_mc_bin=mccli
-[ -n "$MINIO_CLI_BIN"] && default_mc_bin="$MINIO_CLI_BIN"
+[ -n "$MINIO_CLI_BIN" ] && default_mc_bin="$MINIO_CLI_BIN"
 opt_mc_bin=$default_mc_bin
 mc_args=(--no-color --disable-pager)
 export MC_NO_COLOR=1 # Some versions seem to ignore --no-color?
