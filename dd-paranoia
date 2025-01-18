@@ -272,7 +272,9 @@ enum_devices()
     devlist_pcount=() devlist_parts=()
     matched_index=
 
+    local entries
     local tmpfile=$(mktemp)
+    chmod 600 "$tmpfile"
     readarray -t entries < <(lsblk --nodeps --pairs -o NAME,SIZE,MODEL)
 
     dev_count=0
@@ -399,6 +401,7 @@ stat_src()
             return 1
         fi
         local result_tmp=$(mktemp)
+        chmod 600 "$result_tmp"
         $opt_mc_bin "${mc_args[@]}" stat "$opt_src" > "$result_tmp"
         mc_ret="$?"
         mc_crap_workaround
@@ -428,7 +431,7 @@ stat_src()
 
 timeglob() {
     compgen -G "$@" | while read -r m; do
-        [ -d "$m" ] && continue
+        [[ -d "$m" ]] && continue
         # %Y: Modification date in UNIX time
         # %n: filename, unquoted and not de-ref'd
         stat --format="%Y:%n" "$m"
