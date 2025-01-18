@@ -418,11 +418,25 @@ stat_src()
         then
             return 1
         fi
+
         src_size=$(du -sh "$opt_src" | cut -f1)
         src_date=$(stat --format=%y "$opt_src" | cut -d. -f1)
     fi
 
     return 0
+}
+
+timeglob() {
+    compgen -G "$@" | while read -r m; do
+        [ -d "$m" ] && continue
+        # %Y: Modification date in UNIX time
+        # %n: filename, unquoted and not de-ref'd
+        stat --format="%Y:%n" "$m"
+    done
+}
+
+glob_newest() {
+    timeglob "$@" | sort -t: -n | tail -n1 | cut -d: -f2-
 }
 
 find_newest()
@@ -431,7 +445,7 @@ find_newest()
     then
         usage
         echo
-        echo "-n / --newest requires an argument (for example, '*')" >&2
+        echo "Error: -n / --newest requires an argument (for example, '*')" >&2
         exit 1
     fi
 
@@ -440,26 +454,26 @@ find_newest()
         # This is extra shady stuff
         if [[ "${opt_src: -1}" != '/' ]]
         then
-            echo "-i / --input must be a directory (specifically, end with a '/') \
+            echo "Error: -i / --input must be a directory (specifically, end with a '/') \
 when -n / --newest in effect and MinIO is used" >&2
             exit 1
         fi
         newest_file="$($opt_mc_bin find "$opt_src" -name "$opt_newest_pattern" --print "{time},{}" | sort --field-separator=',' --key=1 | tail -n1 | cut -d, -f2)"
         mc_crap_workaround
     else
-        if [[ ! -d "$opt_src" ]]
+        if [[ ! -d "$opt_src" ]] # Not true anymore really
         then
-            echo "-i / --input must be a directory when -n / --newest in effect: \
+            echo "Error: -i / --input must be a directory when -n / --newest in effect: \
 \"$opt_src\" is not a directory" >&2
             exit 1
         fi
 
-        newest_file="$(ls -1t -p "$opt_src"/"$opt_newest_pattern" | grep -v '/$' | head -n1)"
+        newest_file="$(glob_newest "$opt_src/$opt_newest_pattern")"
     fi
 
     if [[ -z "$newest_file" ]]
     then
-        echo "\"$opt_src\": Failed to find a source: empty, nonexistent, or unreadable" >&2
+        echo "\"$opt_src/$opt_newest_pattern\": Failed to find a source: empty, nonexistent, or unreadable" >&2
         exit 1
     fi
 
@@ -718,6 +732,12 @@ then
     exit 1
 fi
 
+if [[ -d "$opt_src" && "$use_newest_pattern" = "no" ]]
+then
+    echo "Error: -i / --input cannot be a directory unless -n / --newest is in effect" >&2
+    exit 1
+fi
+
 if [[ "$use_dst_match_model" = "yes" ]]
 then
     # Test the sanity of the regex the user supplied
@@ -738,6 +758,9 @@ fi
 if [[ "$use_newest_pattern" = "yes" ]]
 then
     find_newest
+    echo -n -e "${ANSI_GREEN}Newest input: "
+    echo -n "\"$opt_src\""
+    echo -e "${ANSI_RESET}"
 fi
 
 if [[ "$opt_use_minio" = "no" ]]
