@@ -23,7 +23,7 @@
 # Use of this source code is governed by the Simplified BSD License:
 # https://opensource.org/license/bsd-2-clause
 
-DDP_VERSION=0.8.1
+DDP_VERSION=0.8.2
 
 default_src="(none)"
 default_dst=ask # Only used in `show_help`
@@ -52,7 +52,7 @@ mc_args=(--no-color --disable-pager)
 export MC_NO_COLOR=1 # Some versions seem to ignore --no-color?
 
 default_dd_blocksize=8M
-opt_dd_blocksize=$default_dd_blocksize
+opt_dd_blocksize="bs=$default_dd_blocksize"
 
 ANSI_RED="\e[31;1m"
 ANSI_GREEN="\e[32;1m"
@@ -581,9 +581,8 @@ transfer()
     fi
 
     local suffix=${opt_src/*.}
-    local dd_opts_show=("of=\"$opt_dst\"" "conv=fdatasync" "status=progress")
-    local dd_opts_exec=("of=$opt_dst" "conv=fdatasync" "status=progress")
-    [[ -n "$opt_dd_blocksize" ]] && dd_opts+=("bs=$opt_dd_blocksize")
+    local dd_opts_show=("of=\"$opt_dst\"" "$opt_dd_blocksize" "conv=fdatasync" "status=progress")
+    local dd_opts_exec=("of=$opt_dst" "$opt_dd_blocksize" "conv=fdatasync" "status=progress")
 
     if [[ "$suffix" = "gz" ]]
     then
@@ -660,7 +659,7 @@ do
             shift
             ;;
         -t | --block-size)
-            opt_dd_blocksize=$2
+            opt_dd_blocksize="bs=$2"
             shift;
             ;;
         -r | --sudo)
